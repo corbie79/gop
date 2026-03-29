@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,7 +8,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -26,15 +24,15 @@ var (
 
 // Manifest represents gop-manifest.yaml
 type Manifest struct {
-	Name        string            `yaml:"name"`
-	Module      string            `yaml:"module"`
-	Version     string            `yaml:"version"`
-	Description string            `yaml:"description"`
-	License     string            `yaml:"license"`
-	Authors     []string          `yaml:"authors"`
-	Repository  string            `yaml:"repository"`
-	Keywords    []string          `yaml:"keywords"`
-	Build       ManifestBuild     `yaml:"build"`
+	Name        string        `yaml:"name"`
+	Module      string        `yaml:"module"`
+	Version     string        `yaml:"version"`
+	Description string        `yaml:"description"`
+	License     string        `yaml:"license"`
+	Authors     []string      `yaml:"authors"`
+	Repository  string        `yaml:"repository"`
+	Keywords    []string      `yaml:"keywords"`
+	Build       ManifestBuild `yaml:"build"`
 }
 
 type ManifestBuild struct {
@@ -50,19 +48,20 @@ type ManifestTarget struct {
 var publishCmd = &cobra.Command{
 	Use:   "publish",
 	Short: "Publish package to a Git registry (GitHub/GitLab)",
-	Long: `Push your package to a remote Git repository and register it
-in the registry's package system.
+	Long: `Push source code to a remote Git repository and register a release.
+
+The Git repository IS the package source. Users install via git clone.
+  - Public repos: anyone can 'gop install <url>'
+  - Private repos: requires 'gop login' first
 
 This command:
   1. Reads gop-manifest.yaml for package metadata
-  2. Tags the release with the manifest version
-  3. Pushes code + tag to the remote repository
-  4. Registers the package in the registry (GitLab Package Registry / GitHub Release)
+  2. Creates remote repository if needed (via API)
+  3. Pushes all source code + version tag
+  4. Creates a Release (GitHub Release / GitLab Release)
 
-Prerequisites:
-  - gop-manifest.yaml exists (created by 'gop create')
-  - Git remote 'origin' is configured pointing to the registry
-  - You are logged in (gop login)
+The release includes the git clone URL so users can install with:
+  gop install <clone-url> --version <tag>
 
 Examples:
   gop publish --registry github
@@ -113,12 +112,18 @@ func runPublish() error {
 		return err
 	}
 
-	// 4. Ensure remote is set
+	// 4. Ensure remote is set (creates repo via API if needed)
 	remoteURL, err := ensureRemote(reg, manifest)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Remote: %s\n", remoteURL)
+
+	// Update manifest repository field if empty
+	if manifest.Repository == "" {
+		manifest.Repository = remoteURL
+	}
+
+	fmt.Printf("Repository: %s\n", remoteURL)
 
 	// 5. Tag version
 	tag := publishTag
@@ -129,42 +134,40 @@ func runPublish() error {
 		return err
 	}
 
-	// 6. Push code + tags
-	fmt.Println("Pushing to remote...")
+	// 6. Push source code + tags to git repository
+	fmt.Println("Pushing source to repository...")
 	if err := gitPush(); err != nil {
 		return err
 	}
 	if err := gitPushTags(); err != nil {
 		return err
 	}
+	fmt.Println("Source code pushed successfully.")
 
-	// 7. Create source archive
-	archivePath, err := createSourceArchive(manifest, tag)
-	if err != nil {
-		fmt.Printf("Warning: source archive creation failed: %v\n", err)
-	} else {
-		defer os.Remove(archivePath)
-		fi, _ := os.Stat(archivePath)
-		fmt.Printf("Source archive: %s (%.1f KB)\n", filepath.Base(archivePath), float64(fi.Size())/1024)
-	}
-
-	// 8. Register in registry with source
+	// 7. Create release (metadata pointing to the git repo)
 	switch reg.Type {
 	case config.RegistryTypeGitHub:
-		if err := publishGitHubRelease(reg, manifest, tag, archivePath); err != nil {
+		if err := publishGitHubRelease(reg, manifest, tag); err != nil {
 			fmt.Printf("Warning: GitHub release creation failed: %v\n", err)
-			fmt.Println("Code and tag pushed successfully. Create release manually on GitHub.")
+			fmt.Println("Source is pushed. Create release manually on GitHub.")
 		}
 	case config.RegistryTypeGitLab:
-		if err := publishGitLabRelease(reg, manifest, tag, archivePath); err != nil {
+		if err := publishGitLabRelease(reg, manifest, tag); err != nil {
 			fmt.Printf("Warning: GitLab release creation failed: %v\n", err)
-			fmt.Println("Code and tag pushed successfully. Create release manually on GitLab.")
+			fmt.Println("Source is pushed. Create release manually on GitLab.")
 		}
 	default:
-		fmt.Println("Code and tag pushed. Generic git registries don't support package registration.")
+		fmt.Println("Source pushed to git repository.")
 	}
 
+	cloneURL := remoteURL
 	fmt.Printf("\nPublished %s %s to %s (%s)\n", manifest.Name, tag, reg.Name, reg.Type)
+	fmt.Println("\nInstall with:")
+	fmt.Printf("  gop install %s --version %s\n", cloneURL, tag)
+	if publishRegistry != "" {
+		fmt.Printf("  gop install %s:%s --version %s\n", reg.Name, repoPathFromURL(remoteURL), tag)
+	}
+
 	return nil
 }
 
@@ -187,13 +190,11 @@ func loadManifest() (*Manifest, error) {
 }
 
 func validateGitState() error {
-	// Check if in a git repo
 	cmd := exec.Command("git", "rev-parse", "--is-inside-work-tree")
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("not a git repository. Run 'git init' first")
 	}
 
-	// Check for uncommitted changes
 	cmd = exec.Command("git", "status", "--porcelain")
 	out, err := cmd.Output()
 	if err != nil {
@@ -207,20 +208,20 @@ func validateGitState() error {
 }
 
 func ensureRemote(reg *config.Registry, m *Manifest) (string, error) {
-	// Check if origin remote exists
 	cmd := exec.Command("git", "remote", "get-url", "origin")
 	out, err := cmd.Output()
 	if err == nil && len(strings.TrimSpace(string(out))) > 0 {
 		return strings.TrimSpace(string(out)), nil
 	}
 
-	// No origin set - construct from registry + manifest
+	// No origin - construct URL and create repo via API
 	repoURL := buildRepoURL(reg, m)
 	if repoURL == "" {
-		return "", fmt.Errorf("no git remote 'origin' configured. Set it manually:\n  git remote add origin <url>")
+		return "", fmt.Errorf("no git remote 'origin' and cannot determine repo URL.\n\nSet it manually:\n  git remote add origin <url>\n\nOr set 'repository' in gop-manifest.yaml")
 	}
 
-	// Try to create repo first
+	// Create repository on the remote
+	fmt.Printf("Creating repository on %s...\n", reg.Name)
 	switch reg.Type {
 	case config.RegistryTypeGitHub:
 		createGitHubRepo(reg, m)
@@ -252,7 +253,6 @@ func buildRepoURL(reg *config.Registry, m *Manifest) string {
 }
 
 func createGitTag(tag string, m *Manifest) error {
-	// Check if tag already exists
 	cmd := exec.Command("git", "tag", "-l", tag)
 	out, err := cmd.Output()
 	if err == nil && strings.TrimSpace(string(out)) == tag {
@@ -274,7 +274,6 @@ func createGitTag(tag string, m *Manifest) error {
 }
 
 func gitPush() error {
-	// Get current branch
 	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
 	out, err := cmd.Output()
 	if err != nil {
@@ -282,7 +281,6 @@ func gitPush() error {
 	}
 	branch := strings.TrimSpace(string(out))
 
-	// Push with retry
 	for attempt := 0; attempt < 4; attempt++ {
 		cmd = exec.Command("git", "push", "-u", "origin", branch)
 		cmd.Stdout = os.Stdout
@@ -316,35 +314,13 @@ func gitPushTags() error {
 	return fmt.Errorf("failed to push tags after 4 attempts")
 }
 
-// ===================== Source Archive =====================
-
-// createSourceArchive creates a tar.gz of the source using git archive.
-func createSourceArchive(m *Manifest, tag string) (string, error) {
-	archiveName := fmt.Sprintf("%s-%s-source.tar.gz", m.Name, m.Version)
-	archivePath := filepath.Join(os.TempDir(), archiveName)
-
-	cmd := exec.Command("git", "archive",
-		"--format=tar.gz",
-		"--prefix="+m.Name+"-"+m.Version+"/",
-		"-o", archivePath,
-		tag)
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("git archive failed: %w", err)
-	}
-
-	return archivePath, nil
-}
-
 // ===================== GitHub Release =====================
 
-func publishGitHubRelease(reg *config.Registry, m *Manifest, tag, archivePath string) error {
+func publishGitHubRelease(reg *config.Registry, m *Manifest, tag string) error {
 	if reg.Token == "" {
 		return fmt.Errorf("no token configured. Run: gop login --registry %s", reg.Name)
 	}
 
-	// Determine owner/repo from remote URL
 	owner, repo, err := parseGitHubRemote()
 	if err != nil {
 		return err
@@ -358,7 +334,7 @@ func publishGitHubRelease(reg *config.Registry, m *Manifest, tag, archivePath st
 	body := map[string]interface{}{
 		"tag_name":               tag,
 		"name":                   fmt.Sprintf("%s %s", m.Name, tag),
-		"body":                   buildReleaseBody(m),
+		"body":                   buildReleaseBody(m, tag),
 		"draft":                  false,
 		"prerelease":             false,
 		"generate_release_notes": true,
@@ -393,57 +369,6 @@ func publishGitHubRelease(reg *config.Registry, m *Manifest, tag, archivePath st
 		fmt.Printf("GitHub Release created: %s\n", htmlURL)
 	}
 
-	// Attach source archive to the release
-	if archivePath != "" {
-		releaseID, _ := result["id"].(float64)
-		if releaseID > 0 {
-			uploadURL := fmt.Sprintf("%s/repos/%s/%s/releases/%d/assets?name=%s",
-				apiURL, owner, repo, int64(releaseID),
-				url.QueryEscape(fmt.Sprintf("%s-%s-source.tar.gz", m.Name, m.Version)))
-
-			if err := uploadGitHubAsset(uploadURL, reg.Token, archivePath); err != nil {
-				fmt.Printf("Warning: source archive upload failed: %v\n", err)
-			} else {
-				fmt.Printf("Source archive attached to GitHub Release.\n")
-			}
-		}
-	}
-
-	return nil
-}
-
-func uploadGitHubAsset(uploadURL, token, filePath string) error {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	fi, err := f.Stat()
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequest("POST", uploadURL, f)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/gzip")
-	req.ContentLength = fi.Size()
-
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("upload failed (%d): %s", resp.StatusCode, string(body))
-	}
-
 	return nil
 }
 
@@ -454,9 +379,8 @@ func parseGitHubRemote() (string, string, error) {
 		return "", "", fmt.Errorf("no origin remote")
 	}
 	remoteURL := strings.TrimSpace(string(out))
-
-	// Parse: https://github.com/owner/repo.git or git@github.com:owner/repo.git
 	remoteURL = strings.TrimSuffix(remoteURL, ".git")
+
 	if strings.Contains(remoteURL, "github.com/") {
 		parts := strings.Split(remoteURL, "github.com/")
 		if len(parts) == 2 {
@@ -481,7 +405,7 @@ func parseGitHubRemote() (string, string, error) {
 
 // ===================== GitLab Release =====================
 
-func publishGitLabRelease(reg *config.Registry, m *Manifest, tag, archivePath string) error {
+func publishGitLabRelease(reg *config.Registry, m *Manifest, tag string) error {
 	if reg.Token == "" {
 		return fmt.Errorf("no token configured. Run: gop login --registry %s", reg.Name)
 	}
@@ -493,11 +417,10 @@ func publishGitLabRelease(reg *config.Registry, m *Manifest, tag, archivePath st
 
 	apiURL := strings.TrimRight(reg.URL, "/") + "/api/v4"
 
-	// Create release via GitLab API
 	body := map[string]interface{}{
 		"tag_name":    tag,
 		"name":        fmt.Sprintf("%s %s", m.Name, tag),
-		"description": buildReleaseBody(m),
+		"description": buildReleaseBody(m, tag),
 	}
 
 	jsonBody, _ := json.Marshal(body)
@@ -526,16 +449,6 @@ func publishGitLabRelease(reg *config.Registry, m *Manifest, tag, archivePath st
 	var result map[string]interface{}
 	json.Unmarshal(respBody, &result)
 
-	// Upload source archive to GitLab Package Registry
-	if archivePath != "" {
-		if err := uploadGitLabPackage(reg, m, apiURL, encodedPath, archivePath); err != nil {
-			fmt.Printf("Warning: GitLab package upload failed: %v\n", err)
-		}
-
-		// Also upload manifest for metadata
-		uploadGitLabManifest(reg, m, apiURL, encodedPath)
-	}
-
 	if links, ok := result["_links"].(map[string]interface{}); ok {
 		if selfLink, ok := links["self"].(string); ok {
 			fmt.Printf("GitLab Release created: %s\n", selfLink)
@@ -543,74 +456,6 @@ func publishGitLabRelease(reg *config.Registry, m *Manifest, tag, archivePath st
 	}
 
 	return nil
-}
-
-func uploadGitLabPackage(reg *config.Registry, m *Manifest, apiURL, encodedPath, archivePath string) error {
-	// Upload source archive to GitLab Generic Package Registry
-	fileName := fmt.Sprintf("%s-%s-source.tar.gz", m.Name, m.Version)
-	pkgURL := fmt.Sprintf("%s/projects/%s/packages/generic/%s/%s/%s",
-		apiURL, encodedPath, m.Name, m.Version, fileName)
-
-	f, err := os.Open(archivePath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	fi, _ := f.Stat()
-
-	req, err := http.NewRequest("PUT", pkgURL, f)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("PRIVATE-TOKEN", reg.Token)
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = fi.Size()
-
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("upload failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("GitLab API error (%d): %s", resp.StatusCode, string(body))
-	}
-
-	fmt.Printf("Source uploaded to GitLab Package Registry: %s v%s (%s)\n", m.Name, m.Version, fileName)
-	return nil
-}
-
-func uploadGitLabManifest(reg *config.Registry, m *Manifest, apiURL, encodedPath string) {
-	// Upload gop-manifest.yaml as package metadata
-	manifestData, err := yaml.Marshal(m)
-	if err != nil {
-		return
-	}
-
-	pkgURL := fmt.Sprintf("%s/projects/%s/packages/generic/%s/%s/gop-manifest.yaml",
-		apiURL, encodedPath, m.Name, m.Version)
-
-	req, err := http.NewRequest("PUT", pkgURL, bytes.NewReader(manifestData))
-	if err != nil {
-		return
-	}
-	req.Header.Set("PRIVATE-TOKEN", reg.Token)
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = int64(len(manifestData))
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return
-	}
-	resp.Body.Close()
-
-	if resp.StatusCode < 400 {
-		fmt.Println("Manifest uploaded to GitLab Package Registry.")
-	}
 }
 
 func parseGitLabRemote(reg *config.Registry) (string, error) {
@@ -622,7 +467,6 @@ func parseGitLabRemote(reg *config.Registry) (string, error) {
 	remoteURL := strings.TrimSpace(string(out))
 	remoteURL = strings.TrimSuffix(remoteURL, ".git")
 
-	// Extract project path from URL
 	baseHost := strings.TrimPrefix(strings.TrimPrefix(reg.URL, "https://"), "http://")
 	baseHost = strings.TrimRight(baseHost, "/")
 
@@ -714,19 +558,43 @@ func createGitLabProject(reg *config.Registry, m *Manifest) {
 
 // ===================== Helpers =====================
 
-func buildReleaseBody(m *Manifest) string {
+func buildReleaseBody(m *Manifest, tag string) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("## %s v%s\n\n", m.Name, m.Version))
+	sb.WriteString(fmt.Sprintf("## %s %s\n\n", m.Name, tag))
 	if m.Description != "" {
 		sb.WriteString(m.Description + "\n\n")
 	}
 	if len(m.Keywords) > 0 {
 		sb.WriteString("**Keywords:** " + strings.Join(m.Keywords, ", ") + "\n\n")
 	}
+
 	sb.WriteString("### Install\n\n")
-	sb.WriteString(fmt.Sprintf("```bash\ngop install %s\n```\n\n", m.Repository))
-	sb.WriteString("---\n*Published with [gop](https://github.com/corbie79/gop)*\n")
+	if m.Repository != "" {
+		sb.WriteString(fmt.Sprintf("```bash\n# Clone and build\ngop install %s --version %s\n```\n\n", m.Repository, tag))
+	}
+	sb.WriteString(fmt.Sprintf("**Module:** `%s`\n", m.Module))
+	if m.License != "" {
+		sb.WriteString(fmt.Sprintf("**License:** %s\n", m.License))
+	}
+	sb.WriteString("\n---\n*Published with [gop](https://github.com/corbie79/gop)*\n")
 	return sb.String()
+}
+
+// repoPathFromURL extracts "org/repo" from a git URL for shorthand display.
+func repoPathFromURL(rawURL string) string {
+	u := strings.TrimSuffix(rawURL, ".git")
+	// https://github.com/org/repo or git@github.com:org/repo
+	for _, sep := range []string{"github.com/", "gitlab.com/", "github.com:", "gitlab.com:"} {
+		if idx := strings.Index(u, sep); idx >= 0 {
+			return u[idx+len(sep):]
+		}
+	}
+	// Generic: take last two path segments
+	parts := strings.Split(strings.Trim(u, "/"), "/")
+	if len(parts) >= 2 {
+		return parts[len(parts)-2] + "/" + parts[len(parts)-1]
+	}
+	return u
 }
 
 func init() {
