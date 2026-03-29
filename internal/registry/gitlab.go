@@ -12,15 +12,6 @@ type GitLabRegistry struct {
 	groupID int
 }
 
-type PackageResult struct {
-	Name        string
-	Description string
-	URL         string
-	CloneURL    string
-	Stars       int
-	LastUpdate  string
-}
-
 func NewGitLabRegistry(url, token string, groupID int) (*GitLabRegistry, error) {
 	opts := []gitlab.ClientOptionFunc{
 		gitlab.WithBaseURL(url),
@@ -37,6 +28,8 @@ func NewGitLabRegistry(url, token string, groupID int) (*GitLabRegistry, error) 
 		groupID: groupID,
 	}, nil
 }
+
+func (r *GitLabRegistry) Type() string { return "gitlab" }
 
 func (r *GitLabRegistry) Search(query string) ([]PackageResult, error) {
 	var results []PackageResult

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/corbie79/gop/internal/config"
+	"github.com/corbie79/gop/internal/registry"
 	"github.com/spf13/cobra"
 )
 
@@ -24,18 +25,24 @@ var (
 )
 
 var loginCmd = &cobra.Command{
-	Use:   "login",
-	Short: "Authenticate with GitLab via browser",
-	Long: `Open the GitLab web login page and automatically save the token.
+	Use:   "login [--registry name]",
+	Short: "Authenticate with GitHub or GitLab via browser",
+	Long: `Open web login page and automatically save the authentication token.
+
+Supported registries:
+  github  - Device Flow (recommended for CLI, no server needed)
+  gitlab  - OAuth callback flow or Personal Access Token
 
 Methods:
-  oauth   - Full OAuth flow: browser login -> auto token save (default)
-  token   - Opens Personal Access Token page, then prompts to paste token
+  auto    - Automatically picks best method per registry type (default)
+  oauth   - OAuth flow (GitLab callback / GitHub device)
+  token   - Opens token creation page, prompts to paste
 
 Examples:
-  gop login                                    # OAuth with first GitLab registry
-  gop login --registry mylab                   # OAuth with specific registry
-  gop login --method token --registry mylab    # Manual token via browser`,
+  gop login                                    # login to first registry
+  gop login --registry github                  # login to specific registry
+  gop login --registry mylab                   # login to GitLab registry
+  gop login --method token                     # manual token paste`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		mgr, err := loadManager()
 		if err != nil {
@@ -46,39 +53,136 @@ Examples:
 		if loginRegistry != "" {
 			r, found := mgr.Config.FindRegistry(loginRegistry)
 			if !found {
-				return fmt.Errorf("registry %q not found", loginRegistry)
-			}
-			if r.Type != config.RegistryTypeGitLab {
-				return fmt.Errorf("registry %q is not a GitLab registry (type: %s)", loginRegistry, r.Type)
+				return fmt.Errorf("registry %q not found. List registries: gop config list", loginRegistry)
 			}
 			reg = r
 		} else {
+			// Pick first github or gitlab registry
 			for i := range mgr.Config.Registries {
-				if mgr.Config.Registries[i].Type == config.RegistryTypeGitLab {
+				t := mgr.Config.Registries[i].Type
+				if t == config.RegistryTypeGitHub || t == config.RegistryTypeGitLab {
 					reg = &mgr.Config.Registries[i]
 					break
 				}
 			}
 			if reg == nil {
-				return fmt.Errorf("no GitLab registry configured. Add one first:\n  gop config add-registry --name mylab --type gitlab --url https://gitlab.com")
+				return fmt.Errorf("no GitHub or GitLab registry configured.\n\nAdd one:\n  gop config add-registry --name github --type github --url https://github.com\n  gop config add-registry --name mylab --type gitlab --url https://gitlab.com")
+			}
+		}
+
+		method := loginMethod
+		if method == "auto" {
+			switch reg.Type {
+			case config.RegistryTypeGitHub:
+				method = "oauth"
+			case config.RegistryTypeGitLab:
+				if reg.ClientID != "" {
+					method = "oauth"
+				} else {
+					method = "token"
+				}
+			default:
+				method = "token"
 			}
 		}
 
 		baseURL := strings.TrimRight(reg.URL, "/")
 
-		switch loginMethod {
-		case "oauth":
-			return runOAuthLogin(baseURL, reg, mgr.ConfigPath, mgr.Config)
-		case "token":
-			return runTokenLogin(baseURL, reg, mgr.ConfigPath, mgr.Config)
+		switch reg.Type {
+		case config.RegistryTypeGitHub:
+			switch method {
+			case "oauth":
+				return runGitHubDeviceLogin(baseURL, reg, mgr.ConfigPath, mgr.Config)
+			case "token":
+				return runGitHubTokenLogin(baseURL, reg, mgr.ConfigPath, mgr.Config)
+			}
+		case config.RegistryTypeGitLab:
+			switch method {
+			case "oauth":
+				return runGitLabOAuthLogin(baseURL, reg, mgr.ConfigPath, mgr.Config)
+			case "token":
+				return runGitLabTokenLogin(baseURL, reg, mgr.ConfigPath, mgr.Config)
+			}
 		default:
-			return fmt.Errorf("unknown method %q (use 'oauth' or 'token')", loginMethod)
+			return runGenericTokenLogin(baseURL, reg, mgr.ConfigPath, mgr.Config)
 		}
+
+		return nil
 	},
 }
 
-// runOAuthLogin opens browser, receives callback, exchanges code for token, saves config.
-func runOAuthLogin(baseURL string, reg *config.Registry, configPath string, cfg *config.Config) error {
+// ===================== GitHub Device Flow =====================
+
+func runGitHubDeviceLogin(baseURL string, reg *config.Registry, configPath string, cfg *config.Config) error {
+	clientID := reg.ClientID
+	if clientID == "" {
+		fmt.Println("GitHub OAuth client_id is not set.")
+		fmt.Println("")
+		fmt.Println("Option 1 - Set up OAuth App:")
+		fmt.Println("  1. Go to: https://github.com/settings/developers")
+		fmt.Println("  2. Create OAuth App -> Enable Device Flow")
+		fmt.Printf("  3. Run: gop config set-oauth --registry %s --client-id YOUR_CLIENT_ID\n", reg.Name)
+		fmt.Println("  4. Run: gop login")
+		fmt.Println("")
+		fmt.Println("Option 2 - Use Personal Access Token instead:")
+		fmt.Printf("  gop login --registry %s --method token\n", reg.Name)
+
+		openBrowser("https://github.com/settings/developers")
+		return nil
+	}
+
+	fmt.Println("Starting GitHub Device Flow login...")
+	fmt.Println("")
+
+	dc, err := registry.RequestDeviceCode(clientID)
+	if err != nil {
+		return fmt.Errorf("failed to start device flow: %w", err)
+	}
+
+	fmt.Printf("  1. Open: %s\n", dc.VerificationURI)
+	fmt.Printf("  2. Enter code: %s\n\n", dc.UserCode)
+
+	if err := openBrowser(dc.VerificationURI); err != nil {
+		fmt.Printf("(Open the URL above manually)\n\n")
+	}
+
+	fmt.Println("Waiting for authorization...")
+
+	tokenResp, err := registry.PollForToken(clientID, dc.DeviceCode, dc.Interval)
+	if err != nil {
+		return err
+	}
+
+	cfg.UpdateRegistryToken(reg.Name, tokenResp.AccessToken)
+	if err := config.Save(cfg, configPath); err != nil {
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+
+	fmt.Printf("\nLogin successful! Token saved for registry %q.\n", reg.Name)
+	fmt.Println("You can now use: gop search, gop install")
+	return nil
+}
+
+func runGitHubTokenLogin(baseURL string, reg *config.Registry, configPath string, cfg *config.Config) error {
+	tokenURL := "https://github.com/settings/tokens/new?description=gop-cli&scopes=repo,read:org"
+	if baseURL != "https://github.com" && baseURL != "https://api.github.com" {
+		// GitHub Enterprise
+		tokenURL = baseURL + "/settings/tokens/new?description=gop-cli&scopes=repo,read:org"
+	}
+
+	fmt.Printf("Opening GitHub token page for registry %q...\n\n", reg.Name)
+	fmt.Println("Create a token with scopes: repo, read:org")
+
+	if err := openBrowser(tokenURL); err != nil {
+		fmt.Printf("Open manually: %s\n", tokenURL)
+	}
+
+	return promptAndSaveToken(reg, cfg, configPath)
+}
+
+// ===================== GitLab OAuth =====================
+
+func runGitLabOAuthLogin(baseURL string, reg *config.Registry, configPath string, cfg *config.Config) error {
 	if reg.ClientID == "" {
 		fmt.Println("OAuth client_id is not configured for this registry.")
 		fmt.Println("")
@@ -90,18 +194,13 @@ func runOAuthLogin(baseURL string, reg *config.Registry, configPath string, cfg 
 		fmt.Println("3. Then run:")
 		fmt.Printf("   gop config set-oauth --registry %s --client-id YOUR_ID --client-secret YOUR_SECRET\n", reg.Name)
 		fmt.Println("4. Finally run: gop login")
-		fmt.Println("")
 
-		if err := openBrowser(baseURL + "/-/user_settings/applications"); err != nil {
-			fmt.Printf("Open manually: %s/-/user_settings/applications\n", baseURL)
-		}
+		openBrowser(baseURL + "/-/user_settings/applications")
 		return nil
 	}
 
-	// Start local callback server on fixed port for predictable redirect URI
 	listener, err := net.Listen("tcp", "127.0.0.1:19287")
 	if err != nil {
-		// Try random port as fallback
 		listener, err = net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			return fmt.Errorf("failed to start callback server: %w", err)
@@ -111,42 +210,10 @@ func runOAuthLogin(baseURL string, reg *config.Registry, configPath string, cfg 
 	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
 
 	authURL := fmt.Sprintf("%s/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=read_api+read_repository",
-		baseURL,
-		url.QueryEscape(reg.ClientID),
-		url.QueryEscape(redirectURI))
+		baseURL, url.QueryEscape(reg.ClientID), url.QueryEscape(redirectURI))
 
 	codeCh := make(chan string, 1)
 	errCh := make(chan error, 1)
-
-	successHTML := `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>gop - Login Successful</title>
-<style>
-body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#f0f2f5}
-.card{background:white;padding:40px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.1);text-align:center;max-width:400px}
-.check{font-size:64px;margin-bottom:16px}
-h2{color:#1a1a2e;margin:0 0 8px}
-p{color:#666;margin:0}
-</style></head>
-<body><div class="card">
-<div class="check">&#10004;</div>
-<h2>Login Successful!</h2>
-<p>Token has been saved. You can close this window.</p>
-</div></body></html>`
-
-	failHTML := `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>gop - Login Failed</title>
-<style>
-body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#f0f2f5}
-.card{background:white;padding:40px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.1);text-align:center;max-width:400px}
-.cross{font-size:64px;margin-bottom:16px;color:#e74c3c}
-h2{color:#1a1a2e;margin:0 0 8px}
-p{color:#666;margin:0}
-</style></head>
-<body><div class="card">
-<div class="cross">&#10008;</div>
-<h2>Login Failed</h2>
-<p>%s</p>
-</div></body></html>`
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
@@ -154,18 +221,15 @@ p{color:#666;margin:0}
 		if code == "" {
 			errMsg := r.URL.Query().Get("error_description")
 			if errMsg == "" {
-				errMsg = r.URL.Query().Get("error")
-			}
-			if errMsg == "" {
 				errMsg = "no authorization code received"
 			}
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			fmt.Fprintf(w, failHTML, errMsg)
+			fmt.Fprintf(w, resultHTML("Login Failed", errMsg, false))
 			errCh <- fmt.Errorf("authentication failed: %s", errMsg)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprint(w, successHTML)
+		fmt.Fprint(w, resultHTML("Login Successful!", "Token saved. You can close this window.", true))
 		codeCh <- code
 	})
 
@@ -175,49 +239,84 @@ p{color:#666;margin:0}
 
 	fmt.Println("Opening browser for GitLab login...")
 	if err := openBrowser(authURL); err != nil {
-		fmt.Printf("\nCannot open browser. Open this URL manually:\n%s\n\n", authURL)
+		fmt.Printf("\nOpen this URL manually:\n%s\n\n", authURL)
 	}
 	fmt.Println("Waiting for login in browser...")
 
 	select {
 	case code := <-codeCh:
 		fmt.Println("Login confirmed! Exchanging token...")
-
-		// Exchange authorization code for access token
-		token, err := exchangeCodeForToken(baseURL, reg.ClientID, reg.ClientSecret, code, redirectURI)
+		token, err := exchangeGitLabToken(baseURL, reg.ClientID, reg.ClientSecret, code, redirectURI)
 		if err != nil {
 			return fmt.Errorf("token exchange failed: %w", err)
 		}
-
-		// Save token to config
 		cfg.UpdateRegistryToken(reg.Name, token)
 		if err := config.Save(cfg, configPath); err != nil {
 			return fmt.Errorf("failed to save config: %w", err)
 		}
-
-		fmt.Printf("\nAuthentication complete! Token saved for registry %q.\n", reg.Name)
-		fmt.Println("You can now use: gop install, gop search")
+		fmt.Printf("\nLogin successful! Token saved for registry %q.\n", reg.Name)
+		fmt.Println("You can now use: gop search, gop install")
 		return nil
-
 	case err := <-errCh:
 		return err
-
 	case <-time.After(120 * time.Second):
-		return fmt.Errorf("login timed out (2 minutes). Try again with: gop login")
+		return fmt.Errorf("login timed out. Try again: gop login")
 	}
 }
 
-type oauthTokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int    `json:"expires_in"`
-	RefreshToken string `json:"refresh_token"`
-	Scope        string `json:"scope"`
-	Error        string `json:"error"`
-	ErrorDesc    string `json:"error_description"`
+func runGitLabTokenLogin(baseURL string, reg *config.Registry, configPath string, cfg *config.Config) error {
+	tokenURL := baseURL + "/-/user_settings/personal_access_tokens"
+
+	fmt.Printf("Opening GitLab token page for registry %q...\n\n", reg.Name)
+	fmt.Println("Create a token with scopes: read_api, read_repository")
+
+	if err := openBrowser(tokenURL); err != nil {
+		fmt.Printf("Open manually: %s\n", tokenURL)
+	}
+
+	return promptAndSaveToken(reg, cfg, configPath)
 }
 
-func exchangeCodeForToken(baseURL, clientID, clientSecret, code, redirectURI string) (string, error) {
+// ===================== Generic Git =====================
+
+func runGenericTokenLogin(baseURL string, reg *config.Registry, configPath string, cfg *config.Config) error {
+	fmt.Printf("Registry %q is type %q.\n\n", reg.Name, reg.Type)
+	fmt.Println("Enter your access token for authentication.")
+	return promptAndSaveToken(reg, cfg, configPath)
+}
+
+// ===================== Shared Helpers =====================
+
+func promptAndSaveToken(reg *config.Registry, cfg *config.Config, configPath string) error {
+	fmt.Println("")
+	fmt.Print("Paste your token here: ")
+
+	var token string
+	fmt.Scanln(&token)
+	token = strings.TrimSpace(token)
+
+	if token == "" {
+		return fmt.Errorf("no token provided")
+	}
+
+	cfg.UpdateRegistryToken(reg.Name, token)
+	if err := config.Save(cfg, configPath); err != nil {
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+
+	fmt.Printf("\nToken saved for registry %q.\n", reg.Name)
+	fmt.Println("You can now use: gop search, gop install")
+	return nil
+}
+
+type gitlabTokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	Error       string `json:"error"`
+	ErrorDesc   string `json:"error_description"`
+}
+
+func exchangeGitLabToken(baseURL, clientID, clientSecret, code, redirectURI string) (string, error) {
 	data := url.Values{
 		"client_id":     {clientID},
 		"client_secret": {clientSecret},
@@ -237,7 +336,7 @@ func exchangeCodeForToken(baseURL, clientID, clientSecret, code, redirectURI str
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}
 
-	var tokenResp oauthTokenResponse
+	var tokenResp gitlabTokenResponse
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		return "", fmt.Errorf("failed to parse token response: %w", err)
 	}
@@ -245,7 +344,6 @@ func exchangeCodeForToken(baseURL, clientID, clientSecret, code, redirectURI str
 	if tokenResp.Error != "" {
 		return "", fmt.Errorf("%s: %s", tokenResp.Error, tokenResp.ErrorDesc)
 	}
-
 	if tokenResp.AccessToken == "" {
 		return "", fmt.Errorf("empty access token in response")
 	}
@@ -253,36 +351,27 @@ func exchangeCodeForToken(baseURL, clientID, clientSecret, code, redirectURI str
 	return tokenResp.AccessToken, nil
 }
 
-// runTokenLogin opens the PAT page and prompts user to paste the token.
-func runTokenLogin(baseURL string, reg *config.Registry, configPath string, cfg *config.Config) error {
-	tokenURL := baseURL + "/-/user_settings/personal_access_tokens"
-
-	fmt.Printf("Opening GitLab token page for registry %q...\n\n", reg.Name)
-	fmt.Println("Create a token with scopes: read_api, read_repository")
-
-	if err := openBrowser(tokenURL); err != nil {
-		fmt.Printf("Open manually: %s\n", tokenURL)
+func resultHTML(title, message string, success bool) string {
+	icon := "&#10004;"
+	color := "#2ecc71"
+	if !success {
+		icon = "&#10008;"
+		color = "#e74c3c"
 	}
-
-	fmt.Println("")
-	fmt.Print("Paste your token here: ")
-
-	var token string
-	fmt.Scanln(&token)
-	token = strings.TrimSpace(token)
-
-	if token == "" {
-		return fmt.Errorf("no token provided")
-	}
-
-	cfg.UpdateRegistryToken(reg.Name, token)
-	if err := config.Save(cfg, configPath); err != nil {
-		return fmt.Errorf("failed to save config: %w", err)
-	}
-
-	fmt.Printf("\nToken saved for registry %q.\n", reg.Name)
-	fmt.Println("You can now use: gop install, gop search")
-	return nil
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>gop - %s</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#f0f2f5}
+.card{background:white;padding:40px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.1);text-align:center;max-width:400px}
+.icon{font-size:64px;margin-bottom:16px;color:%s}
+h2{color:#1a1a2e;margin:0 0 8px}
+p{color:#666;margin:0}
+</style></head>
+<body><div class="card">
+<div class="icon">%s</div>
+<h2>%s</h2>
+<p>%s</p>
+</div></body></html>`, title, color, icon, title, message)
 }
 
 func openBrowser(url string) error {
@@ -304,16 +393,19 @@ func openBrowser(url string) error {
 var configSetOAuthCmd = &cobra.Command{
 	Use:   "set-oauth",
 	Short: "Set OAuth client credentials for a registry",
-	Long: `Set OAuth client_id and client_secret for a GitLab registry.
+	Long: `Set OAuth client_id and client_secret for a GitHub or GitLab registry.
 
-Steps:
+For GitHub:
+  1. Go to https://github.com/settings/developers
+  2. Create OAuth App, enable Device Flow
+  3. Run: gop config set-oauth --registry github --client-id APP_ID
+
+For GitLab:
   1. Go to GitLab > Settings > Applications
   2. Create app with redirect URI: http://127.0.0.1:19287/callback
-  3. Run this command with the credentials
-  4. Run: gop login
+  3. Run: gop config set-oauth --registry mylab --client-id APP_ID --client-secret APP_SECRET
 
-Example:
-  gop config set-oauth --registry mylab --client-id APP_ID --client-secret APP_SECRET`,
+Then: gop login`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		mgr, err := loadManager()
 		if err != nil {
@@ -362,11 +454,11 @@ Example:
 }
 
 func init() {
-	loginCmd.Flags().StringVar(&loginRegistry, "registry", "", "GitLab registry name")
-	loginCmd.Flags().StringVar(&loginMethod, "method", "oauth", "login method: oauth or token")
+	loginCmd.Flags().StringVar(&loginRegistry, "registry", "", "registry name to login to")
+	loginCmd.Flags().StringVar(&loginMethod, "method", "auto", "login method: auto, oauth, or token")
 
 	configSetOAuthCmd.Flags().String("registry", "", "registry name")
 	configSetOAuthCmd.Flags().String("client-id", "", "OAuth client ID")
-	configSetOAuthCmd.Flags().String("client-secret", "", "OAuth client secret")
+	configSetOAuthCmd.Flags().String("client-secret", "", "OAuth client secret (GitLab only)")
 	configCmd.AddCommand(configSetOAuthCmd)
 }

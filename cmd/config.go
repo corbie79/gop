@@ -32,13 +32,22 @@ var configListCmd = &cobra.Command{
 		if len(cfg.Registries) > 0 {
 			fmt.Println("\nRegistries:")
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "NAME\tTYPE\tURL\tGROUP ID")
+			fmt.Fprintln(w, "NAME\tTYPE\tURL\tORG/GROUP\tAUTH")
 			for _, r := range cfg.Registries {
-				groupID := "-"
-				if r.GroupID > 0 {
-					groupID = fmt.Sprintf("%d", r.GroupID)
+				scope := "-"
+				if r.Org != "" {
+					scope = r.Org
+				} else if r.GroupID > 0 {
+					scope = fmt.Sprintf("group:%d", r.GroupID)
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.Name, r.Type, r.URL, groupID)
+				auth := "none"
+				if r.Token != "" {
+					auth = "token"
+				}
+				if r.ClientID != "" {
+					auth += "+oauth"
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.Name, r.Type, r.URL, scope, auth)
 			}
 			w.Flush()
 		} else {
@@ -55,18 +64,26 @@ var (
 	regURL     string
 	regToken   string
 	regGroupID int
+	regOrg     string
 	regLocal   bool
 )
 
 var configAddRegistryCmd = &cobra.Command{
 	Use:   "add-registry",
-	Short: "Add a Git/GitLab registry",
-	Long: `Add a registry to the configuration.
+	Short: "Add a GitHub, GitLab, or Git registry",
+	Long: `Add a registry to the configuration. Supports multiple registries.
+
+Types:
+  github  - GitHub or GitHub Enterprise (search via API, device flow login)
+  gitlab  - GitLab (search via API, OAuth login)
+  git     - Generic Git server (clone only, no search)
 
 Examples:
-  gop config add-registry --name github --type git --url https://github.com
-  gop config add-registry --name mylab --type gitlab --url https://gitlab.com --token $GITLAB_TOKEN
-  gop config add-registry --name mylab --type gitlab --url https://gitlab.example.com --token $TOKEN --group-id 123`,
+  gop config add-registry --name github --type github --url https://github.com
+  gop config add-registry --name gh-work --type github --url https://github.com --org my-company
+  gop config add-registry --name mylab --type gitlab --url https://gitlab.com
+  gop config add-registry --name mylab --type gitlab --url https://gitlab.example.com --group-id 123
+  gop config add-registry --name internal --type git --url https://git.internal.com`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if regName == "" || regURL == "" {
 			return fmt.Errorf("--name and --url are required")
@@ -74,8 +91,13 @@ Examples:
 		if regType == "" {
 			regType = config.RegistryTypeGit
 		}
-		if regType != config.RegistryTypeGit && regType != config.RegistryTypeGitLab {
-			return fmt.Errorf("--type must be 'git' or 'gitlab'")
+		validTypes := map[string]bool{
+			config.RegistryTypeGit:    true,
+			config.RegistryTypeGitLab: true,
+			config.RegistryTypeGitHub: true,
+		}
+		if !validTypes[regType] {
+			return fmt.Errorf("--type must be 'git', 'github', or 'gitlab'")
 		}
 
 		var cfg *config.Config
@@ -106,11 +128,11 @@ Examples:
 			URL:     regURL,
 			Token:   regToken,
 			GroupID: regGroupID,
+			Org:     regOrg,
 		}
 
-		// Check if exists
 		if _, found := cfg.FindRegistry(regName); found {
-			return fmt.Errorf("registry %q already exists", regName)
+			return fmt.Errorf("registry %q already exists (use remove-registry first)", regName)
 		}
 
 		cfg.Registries = append(cfg.Registries, reg)
@@ -120,6 +142,15 @@ Examples:
 		}
 
 		fmt.Printf("Added registry %q (%s) -> %s\n", regName, regType, regURL)
+
+		// Helpful next step hints
+		switch regType {
+		case config.RegistryTypeGitHub:
+			fmt.Printf("\nNext: gop login --registry %s\n", regName)
+		case config.RegistryTypeGitLab:
+			fmt.Printf("\nNext: gop login --registry %s\n", regName)
+		}
+
 		return nil
 	},
 }
@@ -191,11 +222,12 @@ Supported keys:
 }
 
 func init() {
-	configAddRegistryCmd.Flags().StringVar(&regName, "name", "", "registry name")
-	configAddRegistryCmd.Flags().StringVar(&regType, "type", "git", "registry type (git or gitlab)")
+	configAddRegistryCmd.Flags().StringVar(&regName, "name", "", "registry name (unique identifier)")
+	configAddRegistryCmd.Flags().StringVar(&regType, "type", "git", "registry type: github, gitlab, or git")
 	configAddRegistryCmd.Flags().StringVar(&regURL, "url", "", "registry URL")
 	configAddRegistryCmd.Flags().StringVar(&regToken, "token", "", "authentication token")
 	configAddRegistryCmd.Flags().IntVar(&regGroupID, "group-id", 0, "GitLab group ID (optional)")
+	configAddRegistryCmd.Flags().StringVar(&regOrg, "org", "", "GitHub org to scope searches (optional)")
 	configAddRegistryCmd.Flags().BoolVar(&regLocal, "local", false, "save to local project config instead of global")
 
 	configCmd.AddCommand(configListCmd)

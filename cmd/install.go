@@ -14,11 +14,15 @@ var installCmd = &cobra.Command{
 	Short: "Install a package from a Git repository",
 	Long: `Install a Go package by cloning from a Git URL or registry reference.
 
+Supports direct URLs and registry:path shorthand for configured registries.
+
 Examples:
   gop install https://github.com/org/repo.git
   gop install https://gitlab.com/group/project.git --version v1.2.0
   gop install git@github.com:org/repo.git --version main
-  gop install mylab:group/project --name custom-name`,
+  gop install github:spf13/cobra                    # GitHub registry shorthand
+  gop install mylab:group/project                    # GitLab registry shorthand
+  gop install github:org/repo --version v1.0 --name custom-name`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		mgr, err := loadManager()

@@ -18,6 +18,7 @@ const (
 	GlobalConfigFile   = "config.yaml"
 	RegistryTypeGit    = "git"
 	RegistryTypeGitLab = "gitlab"
+	RegistryTypeGitHub = "github"
 )
 
 type Config struct {
@@ -34,6 +35,7 @@ type Registry struct {
 	GroupID      int    `yaml:"group_id,omitempty"`
 	ClientID     string `yaml:"client_id,omitempty"`
 	ClientSecret string `yaml:"client_secret,omitempty"`
+	Org          string `yaml:"org,omitempty"` // GitHub org or GitLab group name
 }
 
 func (c *Config) UpdateRegistryToken(name, token string) {
