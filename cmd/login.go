@@ -158,9 +158,7 @@ func runGitHubDeviceLogin(baseURL string, reg *config.Registry, configPath strin
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
-	fmt.Printf("\nLogin successful! Token saved for registry %q.\n", reg.Name)
-	fmt.Println("You can now use: gop search, gop install")
-	return nil
+	return postLoginSetup(reg, cfg, configPath)
 }
 
 func runGitHubTokenLogin(baseURL string, reg *config.Registry, configPath string, cfg *config.Config) error {
@@ -254,9 +252,7 @@ func runGitLabOAuthLogin(baseURL string, reg *config.Registry, configPath string
 		if err := config.Save(cfg, configPath); err != nil {
 			return fmt.Errorf("failed to save config: %w", err)
 		}
-		fmt.Printf("\nLogin successful! Token saved for registry %q.\n", reg.Name)
-		fmt.Println("You can now use: gop search, gop install")
-		return nil
+		return postLoginSetup(reg, cfg, configPath)
 	case err := <-errCh:
 		return err
 	case <-time.After(120 * time.Second):
@@ -304,9 +300,7 @@ func promptAndSaveToken(reg *config.Registry, cfg *config.Config, configPath str
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
-	fmt.Printf("\nToken saved for registry %q.\n", reg.Name)
-	fmt.Println("You can now use: gop search, gop install")
-	return nil
+	return postLoginSetup(reg, cfg, configPath)
 }
 
 type gitlabTokenResponse struct {
@@ -349,6 +343,199 @@ func exchangeGitLabToken(baseURL, clientID, clientSecret, code, redirectURI stri
 	}
 
 	return tokenResp.AccessToken, nil
+}
+
+// ===================== Post-Login Auto Setup =====================
+
+// postLoginSetup runs after a successful login:
+// 1. Verify token works
+// 2. Fetch user info (username, orgs/groups)
+// 3. Auto-configure org/group if not set
+// 4. Save updated config
+func postLoginSetup(reg *config.Registry, cfg *config.Config, configPath string) error {
+	fmt.Printf("\nLogin successful! Verifying token...\n")
+
+	switch reg.Type {
+	case config.RegistryTypeGitHub:
+		return postLoginGitHub(reg, cfg, configPath)
+	case config.RegistryTypeGitLab:
+		return postLoginGitLab(reg, cfg, configPath)
+	default:
+		fmt.Printf("Logged in to %q.\n", reg.Name)
+		return nil
+	}
+}
+
+func postLoginGitHub(reg *config.Registry, cfg *config.Config, configPath string) error {
+	apiURL := "https://api.github.com"
+	if reg.URL != "https://github.com" && reg.URL != "https://api.github.com" {
+		apiURL = strings.TrimRight(reg.URL, "/") + "/api/v3"
+	}
+
+	// 1. Verify token + get user info
+	userReq, _ := http.NewRequest("GET", apiURL+"/user", nil)
+	userReq.Header.Set("Authorization", "Bearer "+reg.Token)
+	userReq.Header.Set("Accept", "application/vnd.github+json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(userReq)
+	if err != nil {
+		fmt.Printf("Warning: could not verify token: %v\n", err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 401 {
+		return fmt.Errorf("token is invalid or expired. Try logging in again")
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var user struct {
+		Login string `json:"login"`
+		Name  string `json:"name"`
+	}
+	json.Unmarshal(body, &user)
+
+	fmt.Printf("Authenticated as: %s", user.Login)
+	if user.Name != "" {
+		fmt.Printf(" (%s)", user.Name)
+	}
+	fmt.Println()
+
+	// 2. Fetch orgs
+	orgsReq, _ := http.NewRequest("GET", apiURL+"/user/orgs?per_page=50", nil)
+	orgsReq.Header.Set("Authorization", "Bearer "+reg.Token)
+	orgsReq.Header.Set("Accept", "application/vnd.github+json")
+
+	resp2, err := client.Do(orgsReq)
+	if err == nil && resp2.StatusCode == 200 {
+		defer resp2.Body.Close()
+		body2, _ := io.ReadAll(resp2.Body)
+		var orgs []struct {
+			Login string `json:"login"`
+		}
+		json.Unmarshal(body2, &orgs)
+
+		if len(orgs) > 0 {
+			fmt.Printf("Organizations: ")
+			orgNames := make([]string, len(orgs))
+			for i, o := range orgs {
+				orgNames[i] = o.Login
+			}
+			fmt.Println(strings.Join(orgNames, ", "))
+
+			// Auto-set org if not configured and only one org
+			if reg.Org == "" {
+				if len(orgs) == 1 {
+					reg.Org = orgs[0].Login
+					fmt.Printf("Auto-configured org: %s\n", reg.Org)
+				} else {
+					fmt.Println("\nMultiple orgs found. Set one with:")
+					for _, o := range orgs {
+						fmt.Printf("  gop config set-org --registry %s --org %s\n", reg.Name, o.Login)
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Save
+	if err := config.Save(cfg, configPath); err != nil {
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+
+	fmt.Printf("\nRegistry %q is ready. You can now:\n", reg.Name)
+	fmt.Printf("  gop search <query>               # search packages\n")
+	fmt.Printf("  gop install <name>               # install by name\n")
+	if reg.Org != "" {
+		fmt.Printf("  gop install %s:org/repo       # install from org\n", reg.Name)
+	}
+	return nil
+}
+
+func postLoginGitLab(reg *config.Registry, cfg *config.Config, configPath string) error {
+	apiURL := strings.TrimRight(reg.URL, "/") + "/api/v4"
+
+	// 1. Verify token + get user info
+	userReq, _ := http.NewRequest("GET", apiURL+"/user", nil)
+	userReq.Header.Set("PRIVATE-TOKEN", reg.Token)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(userReq)
+	if err != nil {
+		fmt.Printf("Warning: could not verify token: %v\n", err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 401 {
+		return fmt.Errorf("token is invalid or expired. Try logging in again")
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var user struct {
+		Username string `json:"username"`
+		Name     string `json:"name"`
+	}
+	json.Unmarshal(body, &user)
+
+	fmt.Printf("Authenticated as: %s", user.Username)
+	if user.Name != "" {
+		fmt.Printf(" (%s)", user.Name)
+	}
+	fmt.Println()
+
+	// 2. Fetch groups
+	groupsReq, _ := http.NewRequest("GET", apiURL+"/groups?per_page=50&min_access_level=10", nil)
+	groupsReq.Header.Set("PRIVATE-TOKEN", reg.Token)
+
+	resp2, err := client.Do(groupsReq)
+	if err == nil && resp2.StatusCode == 200 {
+		defer resp2.Body.Close()
+		body2, _ := io.ReadAll(resp2.Body)
+		var groups []struct {
+			ID       int    `json:"id"`
+			FullPath string `json:"full_path"`
+			Name     string `json:"name"`
+		}
+		json.Unmarshal(body2, &groups)
+
+		if len(groups) > 0 {
+			fmt.Printf("Groups: ")
+			groupNames := make([]string, len(groups))
+			for i, g := range groups {
+				groupNames[i] = g.FullPath
+			}
+			fmt.Println(strings.Join(groupNames, ", "))
+
+			// Auto-set group_id if not configured and only one group
+			if reg.GroupID == 0 {
+				if len(groups) == 1 {
+					reg.GroupID = groups[0].ID
+					reg.Org = groups[0].FullPath
+					fmt.Printf("Auto-configured group: %s (id: %d)\n", groups[0].FullPath, groups[0].ID)
+				} else {
+					fmt.Println("\nMultiple groups found. Set one with:")
+					for _, g := range groups {
+						fmt.Printf("  gop config set-group --registry %s --group-id %d  # %s\n", reg.Name, g.ID, g.FullPath)
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Save
+	if err := config.Save(cfg, configPath); err != nil {
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+
+	fmt.Printf("\nRegistry %q is ready. You can now:\n", reg.Name)
+	fmt.Printf("  gop search <query>               # search packages\n")
+	fmt.Printf("  gop install <name>               # install by name\n")
+	if reg.Org != "" {
+		fmt.Printf("  gop install %s:%s/repo     # install from group\n", reg.Name, reg.Org)
+	}
+	return nil
 }
 
 func resultHTML(title, message string, success bool) string {
