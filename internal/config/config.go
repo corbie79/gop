@@ -27,11 +27,22 @@ type Config struct {
 }
 
 type Registry struct {
-	Name    string `yaml:"name"`
-	Type    string `yaml:"type"`
-	URL     string `yaml:"url"`
-	Token   string `yaml:"token,omitempty"`
-	GroupID int    `yaml:"group_id,omitempty"`
+	Name         string `yaml:"name"`
+	Type         string `yaml:"type"`
+	URL          string `yaml:"url"`
+	Token        string `yaml:"token,omitempty"`
+	GroupID      int    `yaml:"group_id,omitempty"`
+	ClientID     string `yaml:"client_id,omitempty"`
+	ClientSecret string `yaml:"client_secret,omitempty"`
+}
+
+func (c *Config) UpdateRegistryToken(name, token string) {
+	for i := range c.Registries {
+		if c.Registries[i].Name == name {
+			c.Registries[i].Token = token
+			return
+		}
+	}
 }
 
 type Package struct {
