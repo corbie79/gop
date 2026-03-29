@@ -19,48 +19,80 @@ func EnsureBinDir() (string, error) {
 }
 
 // EnsurePath checks if ~/.gop/bin is in PATH. If not, adds it.
-// Returns true if PATH was modified.
+// Returns true if a shell profile was modified (i.e., first time only).
 func EnsurePath() (bool, error) {
 	binDir := BinDir()
 
-	// Check if already in PATH
-	pathEnv := os.Getenv("PATH")
-	pathSep := string(os.PathListSeparator)
-	for _, p := range strings.Split(pathEnv, pathSep) {
-		if filepath.Clean(p) == filepath.Clean(binDir) {
-			return false, nil
-		}
+	// Add to current process PATH if not present
+	if !isInCurrentPath(binDir) {
+		pathSep := string(os.PathListSeparator)
+		os.Setenv("PATH", binDir+pathSep+os.Getenv("PATH"))
 	}
 
-	// Add to PATH for current process
-	os.Setenv("PATH", binDir+pathSep+pathEnv)
-
-	// Persist to shell profile
+	// Persist to shell profile (idempotent - checks file content before writing)
 	switch runtime.GOOS {
 	case "windows":
-		return true, addPathWindows(binDir)
+		return addPathWindows(binDir)
 	default:
-		return true, addPathUnix(binDir)
+		return addPathUnix(binDir)
 	}
 }
 
-func addPathWindows(binDir string) error {
-	// Use setx to persist PATH for the user
-	// First get existing user PATH
+func isInCurrentPath(binDir string) bool {
+	pathSep := string(os.PathListSeparator)
+	for _, p := range strings.Split(os.Getenv("PATH"), pathSep) {
+		if filepath.Clean(p) == filepath.Clean(binDir) {
+			return true
+		}
+	}
+	return false
+}
+
+// profileContainsPath checks if a shell profile file already has the binDir in any PATH export.
+func profileContainsPath(profilePath, binDir string) bool {
+	data, err := os.ReadFile(profilePath)
+	if err != nil {
+		return false
+	}
+	content := string(data)
+
+	// Check for exact binDir path in any form:
+	//   export PATH="~/.gop/bin:$PATH"
+	//   export PATH="/home/user/.gop/bin:$PATH"
+	//   set -gx PATH ~/.gop/bin $PATH  (fish)
+	cleanBin := filepath.Clean(binDir)
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		// Skip comments
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.Contains(line, cleanBin) && (strings.Contains(line, "PATH") || strings.Contains(line, "path")) {
+			return true
+		}
+	}
+	return false
+}
+
+func addPathWindows(binDir string) (bool, error) {
+	// Get existing user PATH via PowerShell
 	cmd := exec.Command("powershell", "-Command",
 		"[Environment]::GetEnvironmentVariable('PATH', 'User')")
 	out, err := cmd.Output()
 	if err != nil {
-		// Fallback to setx directly
-		return exec.Command("setx", "PATH", fmt.Sprintf("%s;%%PATH%%", binDir)).Run()
+		// Can't read user PATH; try setx only if not already set
+		return false, exec.Command("setx", "PATH", fmt.Sprintf("%s;%%PATH%%", binDir)).Run()
 	}
 
 	currentPath := strings.TrimSpace(string(out))
 
-	// Check if already in user PATH
+	// Check if already in user-level PATH (exact match per segment)
 	for _, p := range strings.Split(currentPath, ";") {
-		if filepath.Clean(p) == filepath.Clean(binDir) {
-			return nil
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		if filepath.Clean(strings.TrimSpace(p)) == filepath.Clean(binDir) {
+			return false, nil // already present, do nothing
 		}
 	}
 
@@ -73,111 +105,129 @@ func addPathWindows(binDir string) error {
 	if len(newPath) > 1024 {
 		cmd := exec.Command("powershell", "-Command",
 			fmt.Sprintf("[Environment]::SetEnvironmentVariable('PATH', '%s', 'User')", newPath))
-		return cmd.Run()
+		if err := cmd.Run(); err != nil {
+			return false, err
+		}
+	} else {
+		if err := exec.Command("setx", "PATH", newPath).Run(); err != nil {
+			return false, err
+		}
 	}
 
-	return exec.Command("setx", "PATH", newPath).Run()
+	fmt.Printf("Added %s to user PATH (Windows)\n", binDir)
+	return true, nil
 }
 
-func addPathUnix(binDir string) error {
+func addPathUnix(binDir string) (bool, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	exportLine := fmt.Sprintf("\n# gop package manager\nexport PATH=\"%s:$PATH\"\n", binDir)
 
-	// Determine which shell profile to modify
-	profiles := detectShellProfiles(home)
-
-	modified := false
-	for _, profile := range profiles {
-		// Check if already added
-		data, err := os.ReadFile(profile)
-		if err == nil && strings.Contains(string(data), binDir) {
-			continue
-		}
-
-		f, err := os.OpenFile(profile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			continue
-		}
-		if _, err := f.WriteString(exportLine); err != nil {
-			f.Close()
-			continue
-		}
-		f.Close()
-		modified = true
-		fmt.Printf("Added %s to PATH in %s\n", binDir, profile)
+	// Determine target shell profile
+	profile := detectShellProfile(home)
+	if profile == "" {
+		return false, fmt.Errorf("could not detect shell profile")
 	}
 
-	if !modified {
-		// Fallback: try .profile
-		profile := filepath.Join(home, ".profile")
-		f, err := os.OpenFile(profile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			return fmt.Errorf("could not update any shell profile: %w", err)
-		}
-		defer f.Close()
-		if _, err := f.WriteString(exportLine); err != nil {
-			return err
-		}
-		fmt.Printf("Added %s to PATH in %s\n", binDir, profile)
+	// Check if already present in the file - prevent duplicates
+	if profileContainsPath(profile, binDir) {
+		return false, nil // already configured, do nothing
 	}
 
-	return nil
+	// Fish shell uses different syntax
+	if strings.Contains(profile, "fish") {
+		exportLine = fmt.Sprintf("\n# gop package manager\nset -gx PATH \"%s\" $PATH\n", binDir)
+	}
+
+	f, err := os.OpenFile(profile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return false, fmt.Errorf("could not open %s: %w", profile, err)
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(exportLine); err != nil {
+		return false, fmt.Errorf("could not write to %s: %w", profile, err)
+	}
+
+	fmt.Printf("Added %s to PATH in %s\n", binDir, profile)
+	return true, nil
 }
 
-func detectShellProfiles(home string) []string {
-	var profiles []string
-
+// detectShellProfile returns the single best profile file to modify.
+// Only one file is modified to avoid duplicates across multiple profiles.
+func detectShellProfile(home string) string {
 	shell := os.Getenv("SHELL")
+
+	// macOS defaults to zsh since Catalina (10.15)
+	if runtime.GOOS == "darwin" && shell == "" {
+		shell = "/bin/zsh"
+	}
 
 	switch {
 	case strings.Contains(shell, "zsh"):
-		profiles = append(profiles, filepath.Join(home, ".zshrc"))
+		// macOS + zsh: .zshrc is the standard interactive shell config
+		return filepath.Join(home, ".zshrc")
+	case strings.Contains(shell, "fish"):
+		return filepath.Join(home, ".config", "fish", "config.fish")
 	case strings.Contains(shell, "bash"):
-		// Prefer .bashrc for interactive shells, also add .bash_profile
+		if runtime.GOOS == "darwin" {
+			// macOS bash reads .bash_profile for login shells (Terminal.app opens login shell)
+			return filepath.Join(home, ".bash_profile")
+		}
+		// Linux bash: .bashrc for interactive shells
 		bashrc := filepath.Join(home, ".bashrc")
 		if _, err := os.Stat(bashrc); err == nil {
-			profiles = append(profiles, bashrc)
+			return bashrc
 		}
-		bashProfile := filepath.Join(home, ".bash_profile")
-		if _, err := os.Stat(bashProfile); err == nil {
-			profiles = append(profiles, bashProfile)
-		}
-	case strings.Contains(shell, "fish"):
-		fishConfig := filepath.Join(home, ".config", "fish", "config.fish")
-		profiles = append(profiles, fishConfig)
+		return filepath.Join(home, ".bash_profile")
 	}
 
-	// If no specific shell detected, try common ones
-	if len(profiles) == 0 {
-		for _, name := range []string{".bashrc", ".zshrc", ".profile"} {
+	// Unknown shell: pick first existing common profile
+	if runtime.GOOS == "darwin" {
+		// macOS: prefer .zshrc since it's the default shell
+		for _, name := range []string{".zshrc", ".bash_profile", ".profile"} {
 			p := filepath.Join(home, name)
 			if _, err := os.Stat(p); err == nil {
-				profiles = append(profiles, p)
-				break
+				return p
 			}
+		}
+		return filepath.Join(home, ".zshrc")
+	}
+
+	for _, name := range []string{".bashrc", ".zshrc", ".profile"} {
+		p := filepath.Join(home, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
 		}
 	}
 
-	return profiles
+	// Last fallback
+	return filepath.Join(home, ".profile")
 }
 
-// PrintPathInstructions shows manual instructions to apply PATH changes.
+// PrintPathInstructions shows instructions to apply PATH changes in current session.
 func PrintPathInstructions() {
 	binDir := BinDir()
 	switch runtime.GOOS {
 	case "windows":
-		fmt.Println("\nPATH has been updated via setx. Restart your terminal to apply.")
+		fmt.Println("\nPATH has been updated. Restart your terminal to apply.")
 	default:
 		shell := os.Getenv("SHELL")
+		if runtime.GOOS == "darwin" && shell == "" {
+			shell = "/bin/zsh"
+		}
 		switch {
 		case strings.Contains(shell, "zsh"):
 			fmt.Printf("\nRun: source ~/.zshrc\n")
 		case strings.Contains(shell, "bash"):
-			fmt.Printf("\nRun: source ~/.bashrc\n")
+			if runtime.GOOS == "darwin" {
+				fmt.Printf("\nRun: source ~/.bash_profile\n")
+			} else {
+				fmt.Printf("\nRun: source ~/.bashrc\n")
+			}
 		case strings.Contains(shell, "fish"):
 			fmt.Printf("\nRun: source ~/.config/fish/config.fish\n")
 		default:
