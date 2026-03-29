@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -136,15 +138,25 @@ func runPublish() error {
 		return err
 	}
 
-	// 7. Register in registry
+	// 7. Create source archive
+	archivePath, err := createSourceArchive(manifest, tag)
+	if err != nil {
+		fmt.Printf("Warning: source archive creation failed: %v\n", err)
+	} else {
+		defer os.Remove(archivePath)
+		fi, _ := os.Stat(archivePath)
+		fmt.Printf("Source archive: %s (%.1f KB)\n", filepath.Base(archivePath), float64(fi.Size())/1024)
+	}
+
+	// 8. Register in registry with source
 	switch reg.Type {
 	case config.RegistryTypeGitHub:
-		if err := publishGitHubRelease(reg, manifest, tag); err != nil {
+		if err := publishGitHubRelease(reg, manifest, tag, archivePath); err != nil {
 			fmt.Printf("Warning: GitHub release creation failed: %v\n", err)
 			fmt.Println("Code and tag pushed successfully. Create release manually on GitHub.")
 		}
 	case config.RegistryTypeGitLab:
-		if err := publishGitLabRelease(reg, manifest, tag); err != nil {
+		if err := publishGitLabRelease(reg, manifest, tag, archivePath); err != nil {
 			fmt.Printf("Warning: GitLab release creation failed: %v\n", err)
 			fmt.Println("Code and tag pushed successfully. Create release manually on GitLab.")
 		}
@@ -304,9 +316,30 @@ func gitPushTags() error {
 	return fmt.Errorf("failed to push tags after 4 attempts")
 }
 
+// ===================== Source Archive =====================
+
+// createSourceArchive creates a tar.gz of the source using git archive.
+func createSourceArchive(m *Manifest, tag string) (string, error) {
+	archiveName := fmt.Sprintf("%s-%s-source.tar.gz", m.Name, m.Version)
+	archivePath := filepath.Join(os.TempDir(), archiveName)
+
+	cmd := exec.Command("git", "archive",
+		"--format=tar.gz",
+		"--prefix="+m.Name+"-"+m.Version+"/",
+		"-o", archivePath,
+		tag)
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("git archive failed: %w", err)
+	}
+
+	return archivePath, nil
+}
+
 // ===================== GitHub Release =====================
 
-func publishGitHubRelease(reg *config.Registry, m *Manifest, tag string) error {
+func publishGitHubRelease(reg *config.Registry, m *Manifest, tag, archivePath string) error {
 	if reg.Token == "" {
 		return fmt.Errorf("no token configured. Run: gop login --registry %s", reg.Name)
 	}
@@ -360,6 +393,57 @@ func publishGitHubRelease(reg *config.Registry, m *Manifest, tag string) error {
 		fmt.Printf("GitHub Release created: %s\n", htmlURL)
 	}
 
+	// Attach source archive to the release
+	if archivePath != "" {
+		releaseID, _ := result["id"].(float64)
+		if releaseID > 0 {
+			uploadURL := fmt.Sprintf("%s/repos/%s/%s/releases/%d/assets?name=%s",
+				apiURL, owner, repo, int64(releaseID),
+				url.QueryEscape(fmt.Sprintf("%s-%s-source.tar.gz", m.Name, m.Version)))
+
+			if err := uploadGitHubAsset(uploadURL, reg.Token, archivePath); err != nil {
+				fmt.Printf("Warning: source archive upload failed: %v\n", err)
+			} else {
+				fmt.Printf("Source archive attached to GitHub Release.\n")
+			}
+		}
+	}
+
+	return nil
+}
+
+func uploadGitHubAsset(uploadURL, token, filePath string) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", uploadURL, f)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/gzip")
+	req.ContentLength = fi.Size()
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("upload failed (%d): %s", resp.StatusCode, string(body))
+	}
+
 	return nil
 }
 
@@ -397,7 +481,7 @@ func parseGitHubRemote() (string, string, error) {
 
 // ===================== GitLab Release =====================
 
-func publishGitLabRelease(reg *config.Registry, m *Manifest, tag string) error {
+func publishGitLabRelease(reg *config.Registry, m *Manifest, tag, archivePath string) error {
 	if reg.Token == "" {
 		return fmt.Errorf("no token configured. Run: gop login --registry %s", reg.Name)
 	}
@@ -442,8 +526,15 @@ func publishGitLabRelease(reg *config.Registry, m *Manifest, tag string) error {
 	var result map[string]interface{}
 	json.Unmarshal(respBody, &result)
 
-	// Also register as a generic package in GitLab Package Registry
-	registerGitLabPackage(reg, m, tag, apiURL, encodedPath)
+	// Upload source archive to GitLab Package Registry
+	if archivePath != "" {
+		if err := uploadGitLabPackage(reg, m, apiURL, encodedPath, archivePath); err != nil {
+			fmt.Printf("Warning: GitLab package upload failed: %v\n", err)
+		}
+
+		// Also upload manifest for metadata
+		uploadGitLabManifest(reg, m, apiURL, encodedPath)
+	}
 
 	if links, ok := result["_links"].(map[string]interface{}); ok {
 		if selfLink, ok := links["self"].(string); ok {
@@ -454,20 +545,61 @@ func publishGitLabRelease(reg *config.Registry, m *Manifest, tag string) error {
 	return nil
 }
 
-func registerGitLabPackage(reg *config.Registry, m *Manifest, tag, apiURL, encodedPath string) {
-	// Register as a generic package in GitLab Package Registry
-	pkgURL := fmt.Sprintf("%s/projects/%s/packages/generic/%s/%s/%s.tar.gz",
-		apiURL, encodedPath, m.Name, m.Version, m.Name)
+func uploadGitLabPackage(reg *config.Registry, m *Manifest, apiURL, encodedPath, archivePath string) error {
+	// Upload source archive to GitLab Generic Package Registry
+	fileName := fmt.Sprintf("%s-%s-source.tar.gz", m.Name, m.Version)
+	pkgURL := fmt.Sprintf("%s/projects/%s/packages/generic/%s/%s/%s",
+		apiURL, encodedPath, m.Name, m.Version, fileName)
 
-	// Create a minimal file to upload (package metadata)
-	manifestData, _ := yaml.Marshal(m)
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 
-	req, err := http.NewRequest("PUT", pkgURL, strings.NewReader(string(manifestData)))
+	fi, _ := f.Stat()
+
+	req, err := http.NewRequest("PUT", pkgURL, f)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("PRIVATE-TOKEN", reg.Token)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = fi.Size()
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("upload failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("GitLab API error (%d): %s", resp.StatusCode, string(body))
+	}
+
+	fmt.Printf("Source uploaded to GitLab Package Registry: %s v%s (%s)\n", m.Name, m.Version, fileName)
+	return nil
+}
+
+func uploadGitLabManifest(reg *config.Registry, m *Manifest, apiURL, encodedPath string) {
+	// Upload gop-manifest.yaml as package metadata
+	manifestData, err := yaml.Marshal(m)
+	if err != nil {
+		return
+	}
+
+	pkgURL := fmt.Sprintf("%s/projects/%s/packages/generic/%s/%s/gop-manifest.yaml",
+		apiURL, encodedPath, m.Name, m.Version)
+
+	req, err := http.NewRequest("PUT", pkgURL, bytes.NewReader(manifestData))
 	if err != nil {
 		return
 	}
 	req.Header.Set("PRIVATE-TOKEN", reg.Token)
 	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = int64(len(manifestData))
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -477,7 +609,7 @@ func registerGitLabPackage(reg *config.Registry, m *Manifest, tag, apiURL, encod
 	resp.Body.Close()
 
 	if resp.StatusCode < 400 {
-		fmt.Printf("Registered in GitLab Package Registry: %s v%s\n", m.Name, m.Version)
+		fmt.Println("Manifest uploaded to GitLab Package Registry.")
 	}
 }
 
