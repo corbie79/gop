@@ -37,7 +37,7 @@ var listCmd = &cobra.Command{
 		}
 
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "NAME\tSOURCE\tVERSION\tCOMMIT\tSTATUS")
+		fmt.Fprintln(w, "NAME\tSOURCE\tVERSION\tCOMMIT\tBINARY\tSTATUS")
 		for _, p := range pkgs {
 			status := "not installed"
 			if p.Installed {
@@ -51,7 +51,11 @@ var listCmd = &cobra.Command{
 			if version == "" {
 				version = "(default)"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", p.Name, p.Source, version, commit, status)
+			binary := "-"
+			if p.BinaryPath != "" {
+				binary = p.BinaryPath
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", p.Name, p.Source, version, commit, binary, status)
 		}
 		w.Flush()
 		return nil

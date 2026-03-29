@@ -19,6 +19,7 @@ type LockedPackage struct {
 	Version        string    `yaml:"version,omitempty"`
 	ResolvedCommit string    `yaml:"resolved_commit"`
 	InstalledAt    time.Time `yaml:"installed_at"`
+	BinaryPath     string    `yaml:"binary_path,omitempty"`
 }
 
 func Load(path string) (*LockFile, error) {

@@ -8,6 +8,7 @@ import (
 
 	"github.com/corbie79/gop/internal/config"
 	"github.com/corbie79/gop/internal/gitclient"
+	"github.com/corbie79/gop/internal/golang"
 	"github.com/corbie79/gop/internal/lockfile"
 )
 
@@ -26,6 +27,7 @@ type PackageInfo struct {
 	ResolvedCommit string
 	InstalledAt    time.Time
 	Installed      bool
+	BinaryPath     string
 }
 
 func NewManager(cfg *config.Config, lf *lockfile.LockFile, configPath, lockPath, baseDir string) *Manager {
@@ -61,9 +63,38 @@ func (m *Manager) Install(nameOrURL, version, name string) error {
 	fmt.Printf("Installing %s from %s...\n", name, gitURL)
 	result, err := gc.Clone(gitURL, installDir, version)
 	if err != nil {
-		// Cleanup on failure
 		os.RemoveAll(installDir)
 		return err
+	}
+
+	// Check if this is a Go project and build it
+	binaryPath := ""
+	goModPath := filepath.Join(installDir, "go.mod")
+	if _, err := os.Stat(goModPath); err == nil {
+		goBin, err := golang.EnsureGo()
+		if err != nil {
+			fmt.Printf("Warning: could not ensure Go installation: %v\n", err)
+			fmt.Println("Package cloned but not built. Install Go and run 'gop update' to build.")
+		} else {
+			binPath, err := golang.BuildAndInstall(goBin, installDir, name)
+			if err != nil {
+				fmt.Printf("Warning: build failed: %v\n", err)
+				fmt.Println("Package cloned but not built.")
+			} else {
+				binaryPath = binPath
+
+				// Ensure PATH includes ~/.gop/bin
+				added, err := golang.EnsurePath()
+				if err != nil {
+					fmt.Printf("Warning: could not update PATH: %v\n", err)
+					fmt.Printf("Add %s to your PATH manually.\n", golang.BinDir())
+				} else if added {
+					golang.PrintPathInstructions()
+				}
+			}
+		}
+	} else {
+		fmt.Println("Not a Go project (no go.mod). Package cloned only.")
 	}
 
 	// Update config
@@ -75,13 +106,17 @@ func (m *Manager) Install(nameOrURL, version, name string) error {
 	m.Config.AddPackage(pkg)
 
 	// Update lockfile
-	m.LockFile.Set(lockfile.LockedPackage{
+	lp := lockfile.LockedPackage{
 		Name:           name,
 		Source:         gitURL,
 		Version:        version,
 		ResolvedCommit: result.CommitHash,
 		InstalledAt:    time.Now(),
-	})
+	}
+	if binaryPath != "" {
+		lp.BinaryPath = binaryPath
+	}
+	m.LockFile.Set(lp)
 
 	// Save
 	if err := config.Save(m.Config, m.ConfigPath); err != nil {
@@ -91,7 +126,10 @@ func (m *Manager) Install(nameOrURL, version, name string) error {
 		return fmt.Errorf("failed to save lock file: %w", err)
 	}
 
-	fmt.Printf("Installed %s @ %s (commit: %s)\n", name, result.Reference, result.CommitHash[:12])
+	fmt.Printf("\nInstalled %s @ %s (commit: %s)\n", name, result.Reference, result.CommitHash[:12])
+	if binaryPath != "" {
+		fmt.Printf("Binary: %s\n", binaryPath)
+	}
 	return nil
 }
 
@@ -101,10 +139,19 @@ func (m *Manager) Remove(name string) error {
 		return fmt.Errorf("package %q not found in config", name)
 	}
 
-	// Remove directory
+	// Remove source directory
 	installDir := filepath.Join(m.BaseDir, m.Config.InstallDir, pkg.Name)
 	if err := os.RemoveAll(installDir); err != nil {
 		return fmt.Errorf("failed to remove package directory: %w", err)
+	}
+
+	// Remove binary from ~/.gop/bin
+	if locked, ok := m.LockFile.Get(name); ok && locked.BinaryPath != "" {
+		if err := os.Remove(locked.BinaryPath); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("Warning: could not remove binary %s: %v\n", locked.BinaryPath, err)
+		} else {
+			fmt.Printf("Removed binary: %s\n", locked.BinaryPath)
+		}
 	}
 
 	// Update config and lockfile
@@ -160,14 +207,37 @@ func (m *Manager) Update(name string) error {
 		return err
 	}
 
+	// Rebuild if Go project and source changed
+	binaryPath := ""
+	if oldCommit != result.CommitHash {
+		goModPath := filepath.Join(installDir, "go.mod")
+		if _, err := os.Stat(goModPath); err == nil {
+			goBin, err := golang.EnsureGo()
+			if err == nil {
+				binPath, err := golang.BuildAndInstall(goBin, installDir, name)
+				if err != nil {
+					fmt.Printf("Warning: rebuild failed: %v\n", err)
+				} else {
+					binaryPath = binPath
+				}
+			}
+		}
+	}
+
 	// Update lockfile
-	m.LockFile.Set(lockfile.LockedPackage{
+	lp := lockfile.LockedPackage{
 		Name:           name,
 		Source:         pkg.Source,
 		Version:        pkg.Version,
 		ResolvedCommit: result.CommitHash,
 		InstalledAt:    time.Now(),
-	})
+	}
+	if binaryPath != "" {
+		lp.BinaryPath = binaryPath
+	} else if locked, ok := m.LockFile.Get(name); ok {
+		lp.BinaryPath = locked.BinaryPath
+	}
+	m.LockFile.Set(lp)
 
 	if err := m.LockFile.Save(m.LockPath); err != nil {
 		return fmt.Errorf("failed to save lock file: %w", err)
@@ -217,6 +287,7 @@ func (m *Manager) List() []PackageInfo {
 		if locked, ok := m.LockFile.Get(pkg.Name); ok {
 			info.ResolvedCommit = locked.ResolvedCommit
 			info.InstalledAt = locked.InstalledAt
+			info.BinaryPath = locked.BinaryPath
 		}
 		result = append(result, info)
 	}
