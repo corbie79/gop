@@ -39,6 +39,7 @@ func init() {
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(configCmd)
+	rootCmd.AddCommand(loginCmd)
 }
 
 func loadManager() (*packages.Manager, error) {
