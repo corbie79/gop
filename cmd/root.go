@@ -40,6 +40,8 @@ func init() {
 	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(configCmd)
 	rootCmd.AddCommand(loginCmd)
+	rootCmd.AddCommand(createCmd)
+	rootCmd.AddCommand(publishCmd)
 }
 
 func loadManager() (*packages.Manager, error) {
