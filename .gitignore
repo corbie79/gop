@@ -1,0 +1,15 @@
+# Binary
+gop
+
+# Package install directory
+.gop_packages/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
