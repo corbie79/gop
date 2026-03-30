@@ -17,9 +17,11 @@ import (
 )
 
 var (
-	publishRegistry string
-	publishTag      string
-	publishMessage  string
+	publishRegistry   string
+	publishTag        string
+	publishMessage    string
+	publishPath       string
+	publishVisibility string
 )
 
 // Manifest represents gop-manifest.yaml
@@ -63,9 +65,14 @@ This command:
 The release includes the git clone URL so users can install with:
   gop install <clone-url> --version <tag>
 
+Use --path to specify the exact location on GitLab (group/subgroup):
+  gop publish --registry mylab --path team/backend/my-tool
+
 Examples:
   gop publish --registry github
   gop publish --registry mylab --tag v1.2.0
+  gop publish --registry mylab --path infra/tools/my-tool
+  gop publish --registry mylab --path team/backend/api --visibility public
   gop publish --registry github --message "Bug fixes and improvements"`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runPublish()
@@ -245,6 +252,11 @@ func buildRepoURL(reg *config.Registry, m *Manifest) string {
 	baseURL := strings.TrimRight(reg.URL, "/")
 	if reg.Type == config.RegistryTypeGitHub && baseURL == "https://api.github.com" {
 		baseURL = "https://github.com"
+	}
+
+	// --path flag takes priority: exact path like group/subgroup/project
+	if publishPath != "" {
+		return fmt.Sprintf("%s/%s.git", baseURL, publishPath)
 	}
 	if reg.Org != "" {
 		return fmt.Sprintf("%s/%s/%s.git", baseURL, reg.Org, m.Name)
@@ -492,15 +504,30 @@ func createGitHubRepo(reg *config.Registry, m *Manifest) {
 		apiURL = strings.TrimRight(reg.URL, "/") + "/api/v3"
 	}
 
+	isPrivate := publishVisibility == "private"
+
+	repoName := m.Name
+	var orgName string
+
+	if publishPath != "" {
+		parts := strings.Split(publishPath, "/")
+		repoName = parts[len(parts)-1]
+		if len(parts) >= 2 {
+			orgName = parts[0]
+		}
+	} else if reg.Org != "" {
+		orgName = reg.Org
+	}
+
 	body := map[string]interface{}{
-		"name":        m.Name,
+		"name":        repoName,
 		"description": m.Description,
-		"private":     false,
+		"private":     isPrivate,
 	}
 
 	var endpoint string
-	if reg.Org != "" {
-		endpoint = fmt.Sprintf("%s/orgs/%s/repos", apiURL, reg.Org)
+	if orgName != "" {
+		endpoint = fmt.Sprintf("%s/orgs/%s/repos", apiURL, orgName)
 	} else {
 		endpoint = apiURL + "/user/repos"
 	}
@@ -529,14 +556,45 @@ func createGitLabProject(reg *config.Registry, m *Manifest) {
 	}
 
 	apiURL := strings.TrimRight(reg.URL, "/") + "/api/v4"
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	visibility := publishVisibility
+	if visibility == "" {
+		visibility = "private"
+	}
+
+	// Determine project name and namespace
+	projectName := m.Name
+	var namespaceID int
+
+	if publishPath != "" {
+		// --path group/subgroup/project-name
+		parts := strings.Split(publishPath, "/")
+		projectName = parts[len(parts)-1]
+		namespacePath := strings.Join(parts[:len(parts)-1], "/")
+
+		if namespacePath != "" {
+			// Look up the namespace (group/subgroup) by full path
+			nsID, err := lookupGitLabNamespace(apiURL, reg.Token, namespacePath, client)
+			if err != nil {
+				fmt.Printf("Warning: namespace lookup failed for %q: %v\n", namespacePath, err)
+				fmt.Println("Creating project without specific namespace.")
+			} else {
+				namespaceID = nsID
+				fmt.Printf("Found namespace: %s (id: %d)\n", namespacePath, nsID)
+			}
+		}
+	} else if reg.GroupID > 0 {
+		namespaceID = reg.GroupID
+	}
 
 	body := map[string]interface{}{
-		"name":        m.Name,
+		"name":        projectName,
 		"description": m.Description,
-		"visibility":  "private",
+		"visibility":  visibility,
 	}
-	if reg.GroupID > 0 {
-		body["namespace_id"] = reg.GroupID
+	if namespaceID > 0 {
+		body["namespace_id"] = namespaceID
 	}
 
 	jsonBody, _ := json.Marshal(body)
@@ -544,16 +602,90 @@ func createGitLabProject(reg *config.Registry, m *Manifest) {
 	req.Header.Set("PRIVATE-TOKEN", reg.Token)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
+		fmt.Printf("Warning: failed to create project: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 
+	respBody, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode == 201 {
-		fmt.Printf("Created GitLab project: %s\n", m.Name)
+		var result struct {
+			WebURL       string `json:"web_url"`
+			HTTPURLToRepo string `json:"http_url_to_repo"`
+		}
+		json.Unmarshal(respBody, &result)
+		fmt.Printf("Created GitLab project: %s\n", result.WebURL)
+	} else if resp.StatusCode == 400 {
+		// Possibly already exists
+		var errResp struct {
+			Message map[string][]string `json:"message"`
+		}
+		json.Unmarshal(respBody, &errResp)
+		if msgs, ok := errResp.Message["name"]; ok {
+			for _, msg := range msgs {
+				if strings.Contains(msg, "already") {
+					fmt.Println("Project already exists on GitLab.")
+					return
+				}
+			}
+		}
+		fmt.Printf("Warning: GitLab project creation failed (%d): %s\n", resp.StatusCode, string(respBody))
+	} else {
+		fmt.Printf("Warning: GitLab project creation failed (%d): %s\n", resp.StatusCode, string(respBody))
 	}
+}
+
+// lookupGitLabNamespace finds a GitLab namespace (group/subgroup) by its full path.
+func lookupGitLabNamespace(apiURL, token, namespacePath string, client *http.Client) (int, error) {
+	// Try /groups/:path first (works for groups and subgroups)
+	encodedPath := url.PathEscape(namespacePath)
+	req, _ := http.NewRequest("GET", fmt.Sprintf("%s/groups/%s", apiURL, encodedPath), nil)
+	req.Header.Set("PRIVATE-TOKEN", token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		body, _ := io.ReadAll(resp.Body)
+		var group struct {
+			ID int `json:"id"`
+		}
+		if err := json.Unmarshal(body, &group); err == nil && group.ID > 0 {
+			return group.ID, nil
+		}
+	}
+
+	// Fallback: search namespaces
+	req2, _ := http.NewRequest("GET",
+		fmt.Sprintf("%s/namespaces?search=%s", apiURL, url.QueryEscape(namespacePath)), nil)
+	req2.Header.Set("PRIVATE-TOKEN", token)
+
+	resp2, err := client.Do(req2)
+	if err != nil {
+		return 0, err
+	}
+	defer resp2.Body.Close()
+
+	body2, _ := io.ReadAll(resp2.Body)
+	var namespaces []struct {
+		ID       int    `json:"id"`
+		FullPath string `json:"full_path"`
+	}
+	json.Unmarshal(body2, &namespaces)
+
+	for _, ns := range namespaces {
+		if ns.FullPath == namespacePath {
+			return ns.ID, nil
+		}
+	}
+
+	return 0, fmt.Errorf("namespace %q not found", namespacePath)
 }
 
 // ===================== Helpers =====================
@@ -601,4 +733,6 @@ func init() {
 	publishCmd.Flags().StringVar(&publishRegistry, "registry", "", "target registry")
 	publishCmd.Flags().StringVar(&publishTag, "tag", "", "override version tag (default: v<manifest.version>)")
 	publishCmd.Flags().StringVar(&publishMessage, "message", "", "tag/release message")
+	publishCmd.Flags().StringVar(&publishPath, "path", "", "repository path (e.g. group/subgroup/project)")
+	publishCmd.Flags().StringVar(&publishVisibility, "visibility", "", "repository visibility: public, private, internal (default: private)")
 }
