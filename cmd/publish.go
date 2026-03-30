@@ -224,7 +224,20 @@ func ensureRemote(reg *config.Registry, m *Manifest) (string, error) {
 	// No origin - construct URL and create repo via API
 	repoURL := buildRepoURL(reg, m)
 	if repoURL == "" {
-		return "", fmt.Errorf("no git remote 'origin' and cannot determine repo URL.\n\nSet it manually:\n  git remote add origin <url>\n\nOr set 'repository' in gop-manifest.yaml")
+		// For GitHub without org/path: try to get username and create personal repo
+		if reg.Type == config.RegistryTypeGitHub && reg.Token != "" {
+			username := getGitHubUsername(reg)
+			if username != "" {
+				baseURL := strings.TrimRight(reg.URL, "/")
+				if baseURL == "https://api.github.com" {
+					baseURL = "https://github.com"
+				}
+				repoURL = fmt.Sprintf("%s/%s/%s.git", baseURL, username, m.Name)
+			}
+		}
+		if repoURL == "" {
+			return "", fmt.Errorf("no git remote 'origin' and cannot determine repo URL.\n\nSet it manually:\n  git remote add origin <url>\n\nOr use --path: gop publish --registry %s --path <owner>/<repo>", reg.Name)
+		}
 	}
 
 	// Create repository on the remote
@@ -496,6 +509,7 @@ func parseGitLabRemote(reg *config.Registry) (string, error) {
 
 func createGitHubRepo(reg *config.Registry, m *Manifest) {
 	if reg.Token == "" {
+		fmt.Println("Warning: no token. Cannot create GitHub repository.")
 		return
 	}
 
@@ -504,7 +518,8 @@ func createGitHubRepo(reg *config.Registry, m *Manifest) {
 		apiURL = strings.TrimRight(reg.URL, "/") + "/api/v3"
 	}
 
-	isPrivate := publishVisibility == "private"
+	// Default to private unless explicitly set to public
+	isPrivate := publishVisibility != "public"
 
 	repoName := m.Name
 	var orgName string
@@ -523,13 +538,16 @@ func createGitHubRepo(reg *config.Registry, m *Manifest) {
 		"name":        repoName,
 		"description": m.Description,
 		"private":     isPrivate,
+		"auto_init":   false,
 	}
 
 	var endpoint string
 	if orgName != "" {
 		endpoint = fmt.Sprintf("%s/orgs/%s/repos", apiURL, orgName)
+		fmt.Printf("Creating repo %q in org %q...\n", repoName, orgName)
 	} else {
 		endpoint = apiURL + "/user/repos"
+		fmt.Printf("Creating personal repo %q...\n", repoName)
 	}
 
 	jsonBody, _ := json.Marshal(body)
@@ -541,12 +559,33 @@ func createGitHubRepo(reg *config.Registry, m *Manifest) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
+		fmt.Printf("Warning: GitHub API request failed: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 201 {
-		fmt.Printf("Created GitHub repository: %s\n", m.Name)
+	respBody, _ := io.ReadAll(resp.Body)
+
+	switch resp.StatusCode {
+	case 201:
+		var result struct {
+			HTMLURL  string `json:"html_url"`
+			CloneURL string `json:"clone_url"`
+			Private  bool   `json:"private"`
+		}
+		json.Unmarshal(respBody, &result)
+		vis := "public"
+		if result.Private {
+			vis = "private"
+		}
+		fmt.Printf("Created GitHub repository: %s (%s)\n", result.HTMLURL, vis)
+	case 422:
+		// Repository already exists
+		fmt.Println("Repository already exists on GitHub.")
+	case 404:
+		fmt.Printf("Warning: org %q not found or no permission to create repos.\n", orgName)
+	default:
+		fmt.Printf("Warning: GitHub repo creation failed (%d): %s\n", resp.StatusCode, string(respBody))
 	}
 }
 
@@ -710,6 +749,32 @@ func buildReleaseBody(m *Manifest, tag string) string {
 	}
 	sb.WriteString("\n---\n*Published with [gop](https://github.com/corbie79/gop)*\n")
 	return sb.String()
+}
+
+// getGitHubUsername fetches the authenticated user's login from the GitHub API.
+func getGitHubUsername(reg *config.Registry) string {
+	apiURL := "https://api.github.com"
+	if reg.URL != "https://github.com" && reg.URL != "https://api.github.com" {
+		apiURL = strings.TrimRight(reg.URL, "/") + "/api/v3"
+	}
+
+	req, _ := http.NewRequest("GET", apiURL+"/user", nil)
+	req.Header.Set("Authorization", "Bearer "+reg.Token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	var user struct {
+		Login string `json:"login"`
+	}
+	json.Unmarshal(body, &user)
+	return user.Login
 }
 
 // repoPathFromURL extracts "org/repo" from a git URL for shorthand display.
