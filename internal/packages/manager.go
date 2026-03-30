@@ -155,6 +155,13 @@ func (m *Manager) Remove(name string) error {
 	}
 	golang.RemoveDesktopShortcut(name)
 
+	// Stop and remove service if registered
+	if golang.IsServiceRegistered(name) {
+		if err := golang.UnregisterService(name); err != nil {
+			fmt.Printf("Warning: could not remove service: %v\n", err)
+		}
+	}
+
 	// Update config and lockfile
 	m.Config.RemovePackage(name)
 	m.LockFile.Remove(name)

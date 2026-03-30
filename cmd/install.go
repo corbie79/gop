@@ -14,6 +14,8 @@ var (
 	installVersion string
 	installName    string
 	installDesktop bool
+	installService bool
+	serviceArgs    string
 )
 
 var installCmd = &cobra.Command{
@@ -65,6 +67,11 @@ Examples:
 		// Create desktop shortcut if requested
 		if installDesktop {
 			createDesktopShortcutForPackage(mgr, input)
+		}
+
+		// Register as service if requested
+		if installService {
+			registerServiceForPackage(mgr, input)
 		}
 
 		return nil
@@ -160,6 +167,38 @@ func createDesktopShortcutForPackage(mgr *packages.Manager, input string) {
 	fmt.Println("Warning: no binary found, desktop shortcut not created.")
 }
 
+// registerServiceForPackage registers the installed binary as a system service.
+func registerServiceForPackage(mgr *packages.Manager, input string) {
+	pkgs := mgr.List()
+	for _, pkg := range pkgs {
+		if pkg.BinaryPath == "" {
+			continue
+		}
+		var args []string
+		if serviceArgs != "" {
+			args = strings.Fields(serviceArgs)
+		}
+
+		cfg := golang.ServiceConfig{
+			Name:        pkg.Name,
+			DisplayName: pkg.Name,
+			Description: fmt.Sprintf("%s service (installed by gop)", pkg.Name),
+			BinaryPath:  pkg.BinaryPath,
+			Args:        args,
+			AutoRestart: true,
+		}
+
+		result, err := golang.RegisterService(cfg)
+		if err != nil {
+			fmt.Printf("Warning: service registration failed: %v\n", err)
+			return
+		}
+		fmt.Printf("Service registered: %s\n", result)
+		return
+	}
+	fmt.Println("Warning: no binary found, service not registered.")
+}
+
 func isURL(input string) bool {
 	return strings.HasPrefix(input, "http://") ||
 		strings.HasPrefix(input, "https://") ||
@@ -180,4 +219,6 @@ func init() {
 	installCmd.Flags().StringVarP(&installVersion, "version", "v", "", "version (tag, branch, or commit SHA)")
 	installCmd.Flags().StringVarP(&installName, "name", "n", "", "override package name")
 	installCmd.Flags().BoolVar(&installDesktop, "desktop", false, "create desktop shortcut (Windows/Linux/macOS)")
+	installCmd.Flags().BoolVar(&installService, "service", false, "register as system service")
+	installCmd.Flags().StringVar(&serviceArgs, "service-args", "", "arguments to pass when running as service")
 }
