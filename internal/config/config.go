@@ -22,9 +22,26 @@ const (
 )
 
 type Config struct {
-	Registries []Registry `yaml:"registries,omitempty"`
-	Packages   []Package  `yaml:"packages,omitempty"`
-	InstallDir string     `yaml:"install_dir,omitempty"`
+	Registries      []Registry `yaml:"registries,omitempty"`
+	Packages        []Package  `yaml:"packages,omitempty"`
+	InstallDir      string     `yaml:"install_dir,omitempty"`
+	DefaultRegistry string     `yaml:"default_registry,omitempty"`
+}
+
+// GetDefaultRegistry returns the default registry, or the first github/gitlab one.
+func (c *Config) GetDefaultRegistry() *Registry {
+	if c.DefaultRegistry != "" {
+		if r, found := c.FindRegistry(c.DefaultRegistry); found {
+			return r
+		}
+	}
+	for i := range c.Registries {
+		t := c.Registries[i].Type
+		if t == RegistryTypeGitHub || t == RegistryTypeGitLab {
+			return &c.Registries[i]
+		}
+	}
+	return nil
 }
 
 type Registry struct {

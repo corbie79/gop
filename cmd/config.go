@@ -137,6 +137,11 @@ Examples:
 
 		cfg.Registries = append(cfg.Registries, reg)
 
+		// Auto-set default registry if this is the first one
+		if cfg.DefaultRegistry == "" && (regType == config.RegistryTypeGitHub || regType == config.RegistryTypeGitLab) {
+			cfg.DefaultRegistry = regName
+		}
+
 		if err := config.Save(cfg, configPath); err != nil {
 			return err
 		}
@@ -196,7 +201,12 @@ var configSetCmd = &cobra.Command{
 	Long: `Set a configuration value.
 
 Supported keys:
-  install_dir  - Directory for installed packages`,
+  install_dir        - Directory for installed packages
+  default_registry   - Default registry for org/repo shorthand
+
+Example:
+  gop config set default_registry github
+  gop config set install_dir ./vendor_packages`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		mgr, err := loadManager()
@@ -208,8 +218,13 @@ Supported keys:
 		switch key {
 		case "install_dir":
 			mgr.Config.InstallDir = value
+		case "default_registry":
+			if _, found := mgr.Config.FindRegistry(value); !found {
+				return fmt.Errorf("registry %q not found. Add it first: gop config add-registry", value)
+			}
+			mgr.Config.DefaultRegistry = value
 		default:
-			return fmt.Errorf("unknown config key: %s", key)
+			return fmt.Errorf("unknown config key: %s\n\nSupported: install_dir, default_registry", key)
 		}
 
 		if err := config.Save(mgr.Config, mgr.ConfigPath); err != nil {
