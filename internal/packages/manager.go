@@ -145,7 +145,7 @@ func (m *Manager) Remove(name string) error {
 		return fmt.Errorf("failed to remove package directory: %w", err)
 	}
 
-	// Remove binary from ~/.gop/bin
+	// Remove binary from ~/.gop/bin and desktop shortcut
 	if locked, ok := m.LockFile.Get(name); ok && locked.BinaryPath != "" {
 		if err := os.Remove(locked.BinaryPath); err != nil && !os.IsNotExist(err) {
 			fmt.Printf("Warning: could not remove binary %s: %v\n", locked.BinaryPath, err)
@@ -153,6 +153,7 @@ func (m *Manager) Remove(name string) error {
 			fmt.Printf("Removed binary: %s\n", locked.BinaryPath)
 		}
 	}
+	golang.RemoveDesktopShortcut(name)
 
 	// Update config and lockfile
 	m.Config.RemovePackage(name)

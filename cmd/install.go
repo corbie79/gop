@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/corbie79/gop/internal/config"
+	"github.com/corbie79/gop/internal/golang"
 	"github.com/corbie79/gop/internal/packages"
 	"github.com/spf13/cobra"
 )
@@ -12,6 +13,7 @@ import (
 var (
 	installVersion string
 	installName    string
+	installDesktop bool
 )
 
 var installCmd = &cobra.Command{
@@ -43,18 +45,29 @@ Examples:
 
 		input := args[0]
 
+		var installErr error
+
 		// 1. Full URL or registry:path -> install directly
 		if isURL(input) || hasRegistryPrefix(input, mgr.Config) {
-			return mgr.Install(input, installVersion, installName)
+			installErr = mgr.Install(input, installVersion, installName)
+		} else if strings.Contains(input, "/") && !strings.Contains(input, "://") {
+			// 2. org/repo format -> resolve via default registry
+			installErr = installFromShortPath(mgr, input)
+		} else {
+			// 3. Plain name -> search registries in order
+			installErr = installBySearch(mgr, input)
 		}
 
-		// 2. org/repo format -> resolve via default registry
-		if strings.Contains(input, "/") && !strings.Contains(input, "://") {
-			return installFromShortPath(mgr, input)
+		if installErr != nil {
+			return installErr
 		}
 
-		// 3. Plain name -> search registries in order
-		return installBySearch(mgr, input)
+		// Create desktop shortcut if requested
+		if installDesktop {
+			createDesktopShortcutForPackage(mgr, input)
+		}
+
+		return nil
 	},
 }
 
@@ -126,6 +139,27 @@ func installBySearch(mgr *packages.Manager, input string) error {
 	return fmt.Errorf("package %q not found in any registry.\n\nTry:\n  gop install https://github.com/org/%s.git\n  gop install github:org/%s", input, input, input)
 }
 
+// createDesktopShortcutForPackage finds the installed binary and creates a desktop shortcut.
+func createDesktopShortcutForPackage(mgr *packages.Manager, input string) {
+	// Find the package that was just installed
+	pkgs := mgr.List()
+	for _, pkg := range pkgs {
+		if pkg.BinaryPath == "" {
+			continue
+		}
+		// Match by name or by input
+		name := pkg.Name
+		shortcutPath, err := golang.CreateDesktopShortcut(pkg.BinaryPath, name, "Installed via gop")
+		if err != nil {
+			fmt.Printf("Warning: could not create desktop shortcut: %v\n", err)
+			return
+		}
+		fmt.Printf("Desktop shortcut: %s\n", shortcutPath)
+		return
+	}
+	fmt.Println("Warning: no binary found, desktop shortcut not created.")
+}
+
 func isURL(input string) bool {
 	return strings.HasPrefix(input, "http://") ||
 		strings.HasPrefix(input, "https://") ||
@@ -145,4 +179,5 @@ func hasRegistryPrefix(input string, cfg *config.Config) bool {
 func init() {
 	installCmd.Flags().StringVarP(&installVersion, "version", "v", "", "version (tag, branch, or commit SHA)")
 	installCmd.Flags().StringVarP(&installName, "name", "n", "", "override package name")
+	installCmd.Flags().BoolVar(&installDesktop, "desktop", false, "create desktop shortcut (Windows/Linux/macOS)")
 }
